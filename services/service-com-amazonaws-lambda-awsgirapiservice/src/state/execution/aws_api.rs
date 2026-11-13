@@ -870,10 +870,14 @@ pub fn reachable_services() -> Vec<&'static str> {
 
 /// The CREDENTIAL one invocation's calls are signed with.
 ///
-/// Held by the host and never reachable from guest code: it reaches the request's
-/// `Authorization` and `x-amz-security-token` headers and nothing else — no response, no
-/// log and no environment variable of the run ([`super::runtime_environment`] puts no
-/// credential in a run's environment).
+/// Held by the host and never reachable from the code of an EMBEDDED run: it reaches the
+/// request's `Authorization` and `x-amz-security-token` headers and nothing else — no
+/// response, no log and no environment variable of the run
+/// ([`super::runtime_environment`] puts no credential in a run's environment).
+///
+/// FORK-ONLY exception: a function run in a worker ([`super::container`]) is outside this
+/// process and signs its own requests, so its runtime's environment is given this session,
+/// as a Lambda function's is. It is still in no response and no log.
 #[derive(Clone)]
 pub struct CallerIdentity {
     /// The access key id, which is where the service serving a call reads WHO made it.
@@ -912,6 +916,10 @@ pub struct AwsAccess {
     /// role, or `None` where no session could be minted for it, in which case the call is
     /// signed with the credential the framework hands this emulator's handlers.
     identity: Option<CallerIdentity>,
+    /// The address this emulator's data port is published at, where the operation that
+    /// started the run stated it: what a handler running OUTSIDE this process reaches it
+    /// at ([`super::container`]).
+    endpoint: Option<String>,
 }
 
 impl AwsAccess {
@@ -925,7 +933,39 @@ impl AwsAccess {
             runtime,
             region: region.to_string(),
             identity: None,
+            endpoint: None,
         })
+    }
+
+    /// The same access, for an invocation whose handler may run OUTSIDE this process — in
+    /// a worker ([`super::container`]) — and so reach this emulator over its data port,
+    /// published at `endpoint`, rather than through the callback.
+    #[must_use]
+    pub fn published_at(mut self, endpoint: &str) -> Self {
+        self.endpoint = Some(endpoint.to_string());
+        self
+    }
+
+    /// The address this emulator's data port is published at, where one was stated
+    /// ([`AwsAccess::published_at`]).
+    pub(super) fn published_endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    /// The session of the function's execution role this access signs as, where one was
+    /// minted.
+    ///
+    /// FORK-ONLY, and read by [`super::container`] alone: a handler in a worker signs its
+    /// own requests, so the session is put in that runtime's environment, which is where
+    /// Lambda itself puts a function's credentials.
+    pub(super) fn identity(&self) -> Option<&CallerIdentity> {
+        self.identity.as_ref()
+    }
+
+    /// The certificate every listener of this emulator presents, as PEM text: what a
+    /// handler in a worker has to trust to reach the data port.
+    pub(super) fn certificate_authority_pem(&self) -> String {
+        self.callback.certificate_authority().pem()
     }
 
     /// The same access, signing every call it makes as `identity` — the session of the

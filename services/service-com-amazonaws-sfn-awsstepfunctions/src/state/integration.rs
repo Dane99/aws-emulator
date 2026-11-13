@@ -254,7 +254,15 @@ pub const MAX_CALL_CHAIN_DEPTH: u8 = 3;
 /// which Lambda bounds by that function's `Timeout` and not by anything of this
 /// service's. What bounds the thread a run holds across every call it makes is
 /// [`super::asl::MAX_CALL_WAIT_DURATION`], which this stays well inside.
-pub const MAX_CALL_DURATION: Duration = Duration::from_secs(60);
+///
+/// FORK-ONLY: upstream holds this at 60 seconds. This fork lets Lambda run functions in
+/// worker containers, where a handler waits on a database for as long as its function's
+/// `Timeout` allows (Lambda's own wait ceiling is the largest `Timeout` there is, 900
+/// seconds) and where an invocation first QUEUES for a worker that runs one at a time. So
+/// one call is waited for longer than the longest run: 900 seconds and a minute for the
+/// queue ahead of it. A state that wants less says so with its own `TimeoutSeconds`, which
+/// still bounds the call below this.
+pub const MAX_CALL_DURATION: Duration = Duration::from_secs(960);
 
 /// The ARN namespace every service-integration `Resource` is written under: the
 /// `Resource` names Step Functions' own integration, not the target resource.

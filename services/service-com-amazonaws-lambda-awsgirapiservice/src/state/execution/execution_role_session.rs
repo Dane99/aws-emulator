@@ -31,11 +31,16 @@
 //! * It belongs to the EXECUTION ENVIRONMENT rather than to one invocation: Lambda's
 //!   credentials are held by the environment and refreshed, so one session is held per
 //!   function here and re-minted once the clock has brought it close enough to its expiry
-//!   that a run could outlast it ([`REFRESH_MARGIN`]). The one it replaces is given up in the
-//!   credential store, so a request presenting it no longer verifies, and in the token
-//!   service's registry, so it names no identity either; the record the mint left where a
-//!   principal is read from speaks for a credential nothing can present any more, and is
-//!   pruned at its own expiry.
+//!   that a run could outlast it ([`REFRESH_MARGIN`]). The one it replaces is given up —
+//!   in the credential store, so a request presenting it no longer verifies, and in the
+//!   token service's registry, so it names no identity either — once it has EXPIRED, and
+//!   not before (FORK-ONLY: upstream gives it up the moment it is replaced). A run that
+//!   began under it is still presenting it: an embedded run for as long as upstream's 30
+//!   second ceiling, but in this fork a run lasts as long as its function's `Timeout` and
+//!   several workers run one function at once ([`super::container`]), so a session given
+//!   up at its replacement would fail the AWS calls of every run of the function still in
+//!   flight. A session is only replaced once a run that starts now could outlast it, so
+//!   every run that began under it ends before it expires.
 //!
 //! Where nothing can be SHOWN about the role — this emulator holds no IAM record of it (an
 //! execution role is normally provisioned outside the client that creates the function,
@@ -45,9 +50,11 @@
 //! every other in-process call between two emulated services presents. Refusing on a role
 //! this emulator knows nothing about would deny calls AWS permits.
 //!
-//! The credential never reaches the guest: it is held by host code, put on the request's
-//! `Authorization` and session-token headers ([`super::aws_api`]), and in no response, log
-//! or environment variable of the run.
+//! The credential never reaches the guest of an EMBEDDED run: it is held by host code, put
+//! on the request's `Authorization` and session-token headers ([`super::aws_api`]), and in
+//! no response, log or environment variable of the run. (FORK-ONLY: a function run in a
+//! worker signs its own requests, so the session is put in that runtime's environment —
+//! see [`super::container`].)
 
 use ::std::collections::BTreeMap;
 use ::std::time::{Duration, SystemTime};
@@ -93,6 +100,9 @@ pub struct ExecutionRoleSessions {
     /// One held session per `(role ARN, function name)` — a structured key, so no spelling
     /// of either part can collide with another pair's.
     held: BTreeMap<(String, String), Held>,
+    /// The sessions that have been REPLACED and have not yet expired: a run that began
+    /// under one is still signing with it, so it stays valid until the clock ends it.
+    retiring: Vec<Held>,
 }
 
 /// One held session: what a call is signed with, and when it stops being valid.
@@ -139,7 +149,9 @@ pub fn function_sdk_access<Eng: Send + Sync + 'static>(
         SystemTime::now(),
     );
     Some(
-        super::AwsAccess::new(ctx.callback().clone(), region)?.signing_as(identity),
+        super::AwsAccess::new(ctx.callback().clone(), region)?
+            .signing_as(identity)
+            .published_at(ctx.endpoint().as_str()),
     )
 }
 
@@ -172,6 +184,15 @@ pub fn execution_role_identity<Eng: Send + Sync + 'static>(
             forget(engine, store, &held.identity.access_key_id);
         }
     }
+    // And so is a replaced session whose own expiry has now come: no run that began under
+    // it is still going.
+    let (spent, retiring): (Vec<Held>, Vec<Held>) = ::std::mem::take(&mut sessions.retiring)
+        .into_iter()
+        .partition(|replaced| replaced.expires_at <= now);
+    sessions.retiring = retiring;
+    for replaced in spent {
+        forget(engine, store, &replaced.identity.access_key_id);
+    }
     // A held session is used again only while it has a whole run's worth of life left.
     let still_good = sessions
         .held
@@ -182,10 +203,10 @@ pub fn execution_role_identity<Eng: Send + Sync + 'static>(
     }
     let minted = mint(engine, store, &role, function_name, now)?;
     let identity = minted.identity.clone();
-    // The session this one replaces is forgotten where it was held, so a credential this
-    // environment no longer presents stops being valid.
+    // The session this one replaces is handed to no further run, and is forgotten once it
+    // expires: the runs that began under it are still presenting it (see the module docs).
     if let Some(replaced) = sessions.held.insert(key, minted) {
-        forget(engine, store, &replaced.identity.access_key_id);
+        sessions.retiring.push(replaced);
     }
     Some(identity)
 }
@@ -338,7 +359,9 @@ mod tests {
 
     /// RULE: the credential belongs to the execution environment — it is used again while it
     /// has a whole run's worth of life left, and re-minted once the CLOCK has brought it
-    /// nearer than that to its expiry, with the one it replaces left valid nowhere.
+    /// nearer than that to its expiry. The one it replaces is handed to no further run, stays
+    /// valid for the runs still presenting it until its own expiry, and is valid nowhere
+    /// after that.
     ///
     /// The rows differ along WHEN the next call is made: at the same instant, inside the
     /// session's usable span, and past it.
@@ -372,13 +395,28 @@ mod tests {
             if same {
                 continue;
             }
-            // The replaced session is valid nowhere: the token service's registry no longer
-            // names it, so a request presenting it speaks for nobody.
+            // The replaced session still speaks for the runs that began under it...
             let registry =
                 sts_store::service_state(&engine).expect("the engine carries a session registry");
             assert!(
+                registry.lock().session(&first).is_some(),
+                "case {case:?}: expected the replaced session {first:?} to stay valid until \
+                 its own expiry"
+            );
+            // ...and is valid nowhere once the clock has ended it: the token service's
+            // registry no longer names it, so a request presenting it speaks for nobody.
+            let expired = Duration::from_secs(
+                u64::try_from(SESSION_SECONDS).expect("a positive duration"),
+            ) + Duration::from_secs(1);
+            let current = identity(minted_at + expired).expect("a session is still minted");
+            assert_eq!(
+                current, later,
+                "case {case:?}: the session that replaced it is the one still held"
+            );
+            assert!(
                 registry.lock().session(&first).is_none(),
-                "case {case:?}: expected the replaced session {first:?} to be forgotten"
+                "case {case:?}: expected the replaced session {first:?} to be forgotten once \
+                 it expired"
             );
         }
         // One session per (role, function), however many invocations ask for it.
@@ -387,6 +425,11 @@ mod tests {
         assert_eq!(
             held, 1,
             "expected one held session for the one function, got {held}"
+        );
+        let retiring = sessions.lock().retiring.len();
+        assert_eq!(
+            retiring, 0,
+            "expected no replaced session to be kept past its expiry, got {retiring}"
         );
     }
 }

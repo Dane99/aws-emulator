@@ -209,6 +209,13 @@ percent-encoding = "2.3"
 # already in this workspace's lock file.
 aws-sigv4 = { version = "1", default-features = false, features = ["http1", "sign-http"] }
 aws-credential-types = "1"
+# FORK-ONLY: the HTTP client a function is pushed to a worker container and invoked there
+# with (`state::execution::container`). This is an OUTBOUND connection, which the execution
+# contract of `vendor/engine` rules out for an embedded run and this fork makes
+# deliberately, to the workers `EMULATOR_LAMBDA_WORKERS` names and nowhere else. The
+# workspace already declares the crate (the router's own tests use it), so the lock file
+# gains an edge and no package.
+reqwest = { workspace = true }
 # The platform's own values for the names a complete POSIX module carries as plain data —
 # the `open` flags the standard library reads off `os` while being imported
 # (`state::execution::host_posix`) — taken from the C headers rather than written out here.

@@ -766,7 +766,16 @@ pub const MAX_GLOB_CHARS: usize = 256;
 /// outcome stays the definition's. It is wide enough for the calls a real workload
 /// makes, a poll loop whose every revisit invokes a function that runs a caller's own
 /// code included.
-pub const MAX_CALL_WAIT_DURATION: Duration = Duration::from_secs(120);
+///
+/// FORK-ONLY: upstream holds this at 120 seconds. This fork lets Lambda run functions
+/// in worker containers, whose handlers take as long as the work they really do,
+/// and a `Map` state's items are invoked one after the other — so the waiting one run does
+/// is the SUM of its invocations, and an hour is what it is given. The request that starts
+/// an execution is answered only once this walk is over (`StartExecution` plans the whole
+/// run), so this is also the longest such a request can stay open: a client that starts a
+/// long execution needs a read timeout to match, and must not retry the start while it
+/// waits.
+pub const MAX_CALL_WAIT_DURATION: Duration = Duration::from_secs(3600);
 
 /// The most values `States.ArrayRange` builds: its published limit of "1000 items",
 /// past which the function fails rather than returning an oversized array.

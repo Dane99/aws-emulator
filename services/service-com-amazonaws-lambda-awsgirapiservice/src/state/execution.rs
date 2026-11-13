@@ -75,6 +75,10 @@ pub mod python;
 /// it.
 pub mod node;
 
+/// FORK-ONLY: the worker containers a Node.js function is pushed to and run in, where the
+/// operator names any, instead of being run by one of those engines.
+pub mod container;
+
 /// The runtime the handler runs under, in the language the handler is written in.
 mod bootstrap;
 
@@ -246,13 +250,21 @@ pub fn run_memory_claim_mb(memory_size: i32) -> u32 {
 /// The longest a CALLER waits for the RUN of a handler, whatever the function's own timeout
 /// says.
 ///
-/// This is the HOST's ceiling, not the function's: a `Timeout` of up to 900 seconds would
-/// otherwise hold a request open for a quarter of an hour. The run's own deadline is the
+/// This is the HOST's ceiling, not the function's. The run's own deadline is the
 /// function's clamped `Timeout` ([`run_budget`]); this is only how long the answer is
 /// waited for, from the moment this invocation holds the memory to run in — beside the
 /// initialization of the execution environment the handler is called in, which is waited for
 /// on its own span ([`INIT_PHASE_LIMIT`]) because the function's `Timeout` does not bound it.
-pub const HOST_WAIT_CEILING: Duration = Duration::from_secs(30);
+///
+/// FORK-ONLY: upstream holds this at 30 seconds, so that a `Timeout` of up to 900 does not
+/// hold a request open for a quarter of an hour. This fork runs functions in worker
+/// containers ([`container`]), where a handler waits on a database and a function's own
+/// `Timeout` is the bound its author chose — so the ceiling is the largest `Timeout` the
+/// model allows, and a function is cut short by its own configuration and nothing shorter.
+/// It applies to a run of an embedded engine as well: such a run may now last as long as
+/// its function's `Timeout`, and a caller queued behind a full run envelope waits
+/// correspondingly longer before it is throttled ([`PERMIT_WAIT`]).
+pub const HOST_WAIT_CEILING: Duration = Duration::from_secs(900);
 
 /// How long the EXECUTION ENVIRONMENT one invocation runs in may take to be initialized,
 /// which the function's own `Timeout` does not bound.
@@ -539,6 +551,20 @@ impl Invoked {
 /// and no state guard of this service, and the caller's wait for it is bounded by
 /// [`HOST_WAIT_CEILING`] however long the function's own timeout is.
 pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnable> {
+    // FORK-ONLY: a Node.js function the operator's workers cover is run in one of THEM —
+    // by the real runtime, which this emulator pushes the function's package and
+    // configuration to — before anything below inflates that package for an embedded engine
+    // ([`container`]). What a run is reported with afterwards is the same for both.
+    match container::routed(&invocation.function_name, invocation.runtime.as_deref()) {
+        container::Routed::InProcess => {}
+        container::Routed::Misconfigured(why) => return Err(Unrunnable::Internal(why)),
+        container::Routed::Worker(pool) => {
+            let invocation = Arc::new(invocation);
+            let (invoked, started) = container::run(&pool, &invocation).await?;
+            report_run(&invocation, &invoked, started).await;
+            return Ok(invoked);
+        }
+    }
     let Some(engine) = engine_for(invocation.runtime.as_deref()) else {
         return Err(Unrunnable::NoEngine {
             runtime: invocation
@@ -789,6 +815,15 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
     };
 
     let invoked = answered(finished, &request_id, &reported, budget, engine, started);
+    report_run(&reported, &invoked, started).await;
+    Ok(invoked)
+}
+
+/// Report a finished run where Lambda reports one besides its answer: the series the
+/// invocation is metered on, the trace X-Ray records for it and the log its log group holds.
+/// The same for a run an embedded engine made and one a worker made ([`container`]), so a
+/// function is metered, traced and logged alike wherever its handler ran.
+async fn report_run(reported: &Invocation, invoked: &Invoked, started: SystemTime) {
     // What the invocation itself is metered by, once it has run: the time this run took and
     // the failure it came to, on the series Lambda publishes about its own invocations
     // (`super::metrics`). Published off the answer — a metric is not part of what the caller
@@ -832,7 +867,6 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
         )
         .await;
     }
-    Ok(invoked)
 }
 
 /// Meter `invocation` as one request the service THROTTLED: the one `Throttles` datapoint a

@@ -1,0 +1,128 @@
+# The emulator of this fork, a Postgres database, and worker containers that run Lambda
+# functions for real — in the AWS Lambda Node.js 22 image, with a network.
+#
+#   docker compose -f docker/docker-compose.yml up --build -d
+#   . docker/emulator-env.sh            # points the AWS tools of this shell at the emulator
+#   serverless deploy --stage local     # in your service: deploys to the emulator
+#
+# HOW IT FITS TOGETHER
+#
+# The emulator runs a function in process, with no network, EXCEPT a Node.js function
+# that EMULATOR_LAMBDA_WORKERS covers. Such a function is run by a worker: a generic
+# container that holds no function of its own. Before the emulator invokes a function in
+# a worker it PUSHES the worker what the function is — the deployment package and layers
+# it stores, its handler, its timeout and its environment — so what runs is always what
+# was last deployed, and a redeploy needs nothing restarted. Step Functions, the
+# function's configuration, permissions and everything else stay emulated.
+#
+#   * Deploy as usual: `serverless deploy`, or CreateFunction / UpdateFunctionCode /
+#     UpdateFunctionConfiguration through any SDK. Nothing here names a function.
+#   * A function's environment is the one it was deployed with.
+#   * A handler's own AWS SDK calls come back to the emulator, signed as the function's
+#     execution role: the worker's runtime is started with AWS_ENDPOINT_URL, the emulator's
+#     certificate and a session of that role, so the role's policies decide what the
+#     handler may do, as on AWS. (The role has to exist in the emulator's IAM, which it
+#     does when the deploy created it.)
+#   * A worker runs ONE invocation at a time and the emulator queues the rest, so the
+#     number of workers is how many invocations run at once. Any worker runs any function;
+#     a worker that has to switch function is pushed the new one, which is a cold start.
+#   * What a handler writes is its invocation's log in the emulator's CloudWatch Logs, and
+#     is also in `docker compose logs worker-1`.
+#   * The emulator keeps everything in memory: restarting it loses what was deployed.
+#
+# NETWORK
+#
+# The workers share the emulator's network namespace. So a handler reaches the emulator at
+# the address the emulator publishes everywhere (https://127.0.0.1:9297, which is also the
+# address its certificate is for, and the address in every URL it hands out), and reaches
+# the other services of this file by name (`postgres`).
+#
+# REACHING THE EMULATOR FROM THE HOST
+#
+# It serves HTTPS on https://127.0.0.1:9297 with a self-signed certificate, and requires
+# SigV4 signatures made with keys it generates each time it starts. Both are written next
+# to this file, in ./emulator-home/9297/, and `emulator-env.sh` exports them.
+#
+# TO RUN MORE INVOCATIONS AT ONCE
+#
+# Add a `worker-3` like `worker-2`, with a port of its own, and name it in
+# EMULATOR_LAMBDA_WORKERS.
+
+name: aws-emulator
+
+# What every worker is. They differ only in the port the emulator reaches them on, since
+# they share one network namespace.
+x-worker: &worker
+  image: public.ecr.aws/lambda/nodejs:22
+  # The agent in front of the image's own runtime: it takes the functions the emulator
+  # pushes and hands the runtime its invocations.
+  entrypoint: ["/var/lang/bin/node", "/emulator-worker/agent.mjs"]
+  command: []
+  volumes:
+    - ./worker:/emulator-worker:ro
+  # In the emulator's network namespace: see NETWORK above.
+  network_mode: "service:emulator"
+  depends_on:
+    emulator:
+      condition: service_started
+      restart: true
+  # Reaps what a handler's runtime leaves behind when it is stopped at a timeout.
+  init: true
+  restart: unless-stopped
+
+services:
+  emulator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # The emulator runs as the user who owns this checkout, so what it writes to
+    # ./emulator-home is readable on the host. Set EMULATOR_UID and EMULATOR_GID when that
+    # user is not 1000:1000 (`id -u`, `id -g`).
+    user: "${EMULATOR_UID:-1000}:${EMULATOR_GID:-1000}"
+    environment:
+      HOME: /home/emulator
+      EMULATOR_BIND_ADDRESS: 0.0.0.0
+      # <pattern>=<worker>[|<worker>…], entries separated by commas; an entry with no
+      # pattern covers every Node.js function. `orders-*=http://127.0.0.1:8081` would give
+      # the functions of one service a worker of their own.
+      EMULATOR_LAMBDA_WORKERS: http://127.0.0.1:8081|http://127.0.0.1:8082
+      # Usage telemetry is on unless this says otherwise (see the repository README).
+      # EMULATOR_TELEMETRY: "off"
+    ports:
+      - "127.0.0.1:9297:9297"
+    volumes:
+      # The certificate and the credentials this run generated, readable from the host.
+      - ./emulator-home:/home/emulator/.aws/emulator
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--insecure", "https://127.0.0.1:9297/__admin/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      # For looking at what the functions wrote: psql -h 127.0.0.1 -U app app
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username app --dbname app"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  worker-1:
+    <<: *worker
+    environment:
+      EMULATOR_WORKER_PORT: "8081"
+      # Only the emulator, which shares this network namespace, can push a worker code.
+      EMULATOR_WORKER_HOST: 127.0.0.1
+
+  worker-2:
+    <<: *worker
+    environment:
+      EMULATOR_WORKER_PORT: "8082"
+      EMULATOR_WORKER_HOST: 127.0.0.1

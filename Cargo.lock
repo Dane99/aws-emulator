@@ -14641,6 +14641,7 @@ dependencies = [
  "nix",
  "percent-encoding",
  "rand 0.9.5",
+ "reqwest",
  "rquickjs",
  "rustpython-pylib",
  "rustpython-ruff_python_ast",

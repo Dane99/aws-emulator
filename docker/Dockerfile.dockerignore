@@ -1,0 +1,7 @@
+# What the emulator image's build context leaves out. BuildKit reads this file for
+# docker/Dockerfile because it is named after it.
+target/
+.git/
+issues/
+docker/
+**/.DS_Store
